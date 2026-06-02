@@ -212,11 +212,474 @@ M = 32 或 64
 
 ---
 
-## 6. 三个任务的建议输出格式
+## 6. 3D Tokenizer 与结构输入要求
+
+3D tokenizer 是 TRACE-Lite 的地基。decoder 可以保持简洁，但 protein / ligand / interface tokenizer 必须认真设计。
+
+### 6.1 Protein tokenizer
+
+Protein 不应只用 sequence token，也不应只用每个 residue 一个粗 token。第一版建议使用：
+
+```text
+residue token
++ functional-site token
++ continuous local geometry
++ optional pretrained / structure token channel
+```
+
+Protein site token 至少应包含：
+
+```text
+residue type
+chain / residue id
+member atom ids
+site center coordinate
+site type / functional group
+donor / acceptor flags
+charged / hydrophobic / aromatic flags
+metal-coordination candidate flag
+local frame / direction vector
+sidechain chi / rotamer coarse state
+mask / fallback flag
+optional pretrained embedding
+```
+
+核心目标：让模型看到真正可能参与 binding 的 functional site，而不是只看到 residue 名字。
+
+### 6.2 Ligand tokenizer
+
+Ligand 不应只用 SMILES / SELFIES，也不应只用裸 atom list。第一版建议使用：
+
+```text
+atom token
++ pharmacophore group token
++ conformer geometry features
++ atom mapping metadata
+```
+
+Ligand site token 至少应包含：
+
+```text
+atom ids / member atom ids
+atom or group type
+site center coordinate
+formal charge
+donor / acceptor flags
+aromatic / hydrophobic flags
+positive / negative ionizable flags
+halogen / metal-binder flags
+ring centroid / ring normal
+rotatable bond context
+local conformer descriptor
+```
+
+核心目标：同时保留 exact atom grounding 和 group-level pharmacophore 语义。
+
+### 6.3 Complex-level interaction tokenizer
+
+Protein tokenizer 和 ligand tokenizer 只是前半步。binding 任务真正需要的是 interface tokenizer：
+
+```text
+protein site i + ligand site j
+-> pair interaction token pair_ij
+```
+
+Pair token 应包含：
+
+```text
+protein site embedding
+ligand site embedding
+p_i * l_j interaction feature
+distance RBF
+relative direction / orientation
+local-frame relation
+donor-acceptor compatibility
+charge complementarity
+hydrophobic compatibility
+aromatic compatibility
+metal coordination compatibility
+steric clash feature
+```
+
+原则：
+
+```text
+离散 token 给 decoder 使用；
+连续几何给 Pair Interaction Mixer 使用；
+metadata / atom-site mapping 给 site/contact/pose grounding 使用。
+```
+
+不要在 tokenizer 阶段把所有 3D 几何都压扁成离散词。第一版必须保留连续坐标、局部 frame、方向和 pair 几何特征。
+
+---
+
+## 7. 信息压缩三阶段路线
+
+Pair Interaction Mixer 会产生大量 pair token：
+
+```text
+pair_field: [B, Np, Nl, d_pair]
+```
+
+如果直接送入 decoder，长度会随 protein 和 ligand 尺寸爆炸。因此需要 Interaction Resampler：
+
+```text
+[Np, Nl, d_pair]
+-> [M, d_model]
+```
+
+其中：
+
+```text
+M = 32 / 64 / 128
+```
+
+信息压缩不是简单 mean pooling。真实 protein-ligand interaction 是稀疏的，强 contact / anchor / geometry evidence 会被大量无关 pair 稀释。因此压缩模块必须做到：
+
+```text
+1. 固定长度。
+2. 保留关键相互作用。
+3. 保留 attention / grounding 映射。
+4. 同时服务 affinity、site/contact、pose 三任务。
+5. 训练稳定，不在早期做过硬离散选择。
+```
+
+下一版建议分三阶段推进。
+
+---
+
+### 7.1 第一阶段：Continuous Perceiver / Q-Former 风格 Resampler
+
+第一版主路径采用：
+
+```text
+learnable query cross-attention resampler
+```
+
+形象理解：
+
+```text
+把所有 protein-ligand pair interaction 当成大量证据材料；
+派出 M 个可学习 query 像 M 个审稿人；
+每个 query 从所有 pair 里 cross-attend 并写出一张摘要卡片；
+最后得到 M 个 compact interaction tokens。
+```
+
+形式：
+
+```text
+pair_tokens:       [B, Np*Nl, d_pair]
+learnable queries: [M, d_model]
+
+interaction_tokens = CrossAttention(
+    query = learnable_queries,
+    key   = pair_tokens,
+    value = pair_tokens,
+    mask  = pair_mask,
+    bias  = optional_pair_attention_bias
+)
+
+interaction_tokens = SelfAttention(interaction_tokens)
+```
+
+建议加入轻量 bias：
+
+```text
+distance bias
+chemistry compatibility bias
+pair importance bias
+```
+
+第一版选择它的原因：
+
+```text
+1. soft selection，训练稳定。
+2. 固定长度，适合接 unified decoder。
+3. 不要求早期 pair scorer 已经准确。
+4. 可以保存 attention map 做解释。
+5. 兼容三任务共享。
+```
+
+第一版不要使用：
+
+```text
+mean pooling
+single CLS pooling
+hard top-k only
+slot attention only
+VQ only
+```
+
+Continuous Resampler 是第一版最优、最规范的主路径。
+
+---
+
+### 7.2 第二阶段：Sparse top-k / Slot Attention 增强解释性
+
+第二阶段不是替换第一阶段，而是在 continuous resampler 稳定后增强 grounding 和解释性。
+
+#### Sparse top-k
+
+形象理解：
+
+```text
+先让助理从几千/几万个 pair 里挑出最可能重要的 K 条证据；
+再让 M 个 query 精读这些证据并总结。
+```
+
+形式：
+
+```text
+score_ij = PairImportanceHead(pair_ij)
+topK_pairs = select_topK(pair_tokens, score_ij)
+interaction_tokens = CrossAttention(queries, topK_pairs, topK_pairs)
+```
+
+建议训练节奏：
+
+```text
+early: dense / soft attention
+middle: soft top-k / sparse attention
+late: optional hard top-k candidate pruning
+```
+
+不建议第一版直接 hard top-k，因为早期 pair importance score 不准，可能把真正关键的 contact / anchor pair 排除掉。
+
+#### Slot Attention
+
+形象理解：
+
+```text
+给模型 M 个文件夹，让它把 pair evidence 自动分组：
+文件夹 1 可能收集氢键证据；
+文件夹 2 可能收集疏水 pocket；
+文件夹 3 可能收集盐桥；
+文件夹 4 可能收集 pose anchor。
+```
+
+价值：
+
+```text
+1. 可能形成更清楚的 interaction group。
+2. 有利于 case study 和解释。
+3. 有利于把 compact token 与具体 pair 区域对应。
+```
+
+风险：
+
+```text
+1. 训练比普通 cross-attention 更难。
+2. 容易 slot collapse。
+3. 不同 seed 下 slot 语义可能不稳定。
+4. 需要 diversity / orthogonality / coverage regularization。
+```
+
+因此 Slot Attention 可作为第二阶段增强或 ablation，不作为第一版主路径。
+
+---
+
+### 7.3 第三阶段：VQ / Discrete Interaction Code
+
+VQ 全称是：
+
+```text
+Vector Quantization
+```
+
+中文是：
+
+```text
+向量量化
+```
+
+VQ 的核心不是“连续表示”，而是：
+
+```text
+continuous interaction vector
+-> nearest codebook vector
+-> discrete code id
+-> <INTERACTION_CODE_k>
+```
+
+形象理解：
+
+```text
+连续表示像高清照片，细节很多但难命名；
+VQ 像给照片归类贴标签，把复杂模式放进一本有限词典。
+```
+
+在 TRACE-Lite 中，VQ 的潜在价值是：
+
+```text
+1. 把 interaction pattern 变成离散词表。
+2. 让 decoder 更像语言模型，可以预测 / 生成 interaction code。
+3. 方便统计哪些 code 与 affinity、site、pose 相关。
+4. 让相似 interaction pattern 复用同一个 code，提高抽象能力。
+5. 后期支持 masked interaction-code pretraining 或 trace language。
+```
+
+例如：
+
+```text
+CODE_17 可能对应强氢键模式
+CODE_42 可能对应疏水 pocket 模式
+CODE_81 可能对应芳香堆叠模式
+CODE_103 可能对应金属配位模式
+CODE_140 可能对应 steric clash 模式
+```
+
+但是，VQ 不适合第一版主路径。原因：
+
+```text
+1. 会产生量化误差。
+2. 可能丢掉 pose/contact 所需的精细距离和方向。
+3. codebook 可能 collapse 或使用不均。
+4. 需要 commitment loss / codebook usage regularization。
+5. 如果 continuous pair representation 还没学稳，VQ 会放大不稳定。
+```
+
+因此第三阶段建议是：
+
+```text
+先用 continuous interaction tokens 跑通三任务；
+再对 continuous tokens 做 offline clustering / prototype analysis；
+如果自然形成有意义的 interaction clusters，再训练 VQ / FSQ / discrete interaction code；
+VQ 作为解释性和离散生成增强，而不是第一版性能主路径。
+```
+
+---
+
+### 7.4 三阶段最终顺序
+
+最终顺序应为：
+
+```text
+第一阶段：continuous resampler
+    目标：先学会看懂 protein-ligand interaction。
+
+第二阶段：sparse / slot grounding
+    目标：增强解释性、定位能力和 pair-level grounding。
+
+第三阶段：VQ / discrete code
+    目标：把稳定的 continuous interaction pattern 命名成离散结构语言。
+```
+
+不要反过来。特别是不要在三任务闭环未稳定前，把 VQ 或 hard top-k 作为主压缩机制。
+
+---
+
+## 8. Interaction Resampler 训练与监督要求
+
+为了让压缩模块不是自由乱学，第一版建议加入轻量辅助监督。
+
+### 8.1 Pair contact auxiliary loss
+
+```text
+pair_contact_logit_ij = ContactHead(pair_ij)
+L_pair_contact = BCE / focal loss over pair contacts
+```
+
+目标：让 pair field 具备基本 contact recognition 能力。
+
+### 8.2 Protein site auxiliary loss
+
+```text
+protein_site_logit_i = SiteHead(protein_site_i, pair_context_i)
+L_site_aux = BCE / focal loss over protein site labels
+```
+
+目标：让 protein site token 和 pair context 对 binding site 有可学习信号。
+
+### 8.3 Resampler attention coverage loss
+
+目标：真实 contact / anchor pair 应该被至少一部分 interaction query attend 到。
+
+形式可以是：
+
+```text
+max_m attention[m, true_contact_pair] should be high
+```
+
+或者：
+
+```text
+sum attention mass over true contacts should exceed threshold
+```
+
+### 8.4 Diversity / anti-collapse regularization
+
+避免所有 interaction tokens 关注同一个区域。
+
+可选：
+
+```text
+attention diversity loss
+slot / query off-diagonal cosine penalty
+coverage entropy regularization
+```
+
+原则：不同 compact token 应该覆盖不同 interaction evidence，而不是全部看同一个高分 pair。
+
+---
+
+## 9. 三任务如何使用压缩结果
+
+### 9.1 Affinity
+
+Affinity 任务主要使用 compact interaction tokens 的全局 summary：
+
+```text
+interaction_tokens
+-> unified decoder
+-> <AFF_BIN_k> <AFF_RES_r>
+```
+
+可以加一个训练辅助 head：
+
+```text
+affinity_aux = MLP(pool(interaction_tokens))
+```
+
+但主接口仍然是生成式 affinity token。
+
+### 9.2 Site / Contact
+
+Site/contact 不能只依赖压缩 token。必须保留 pair field 作为高分辨率底图。
+
+推荐：
+
+```text
+compact interaction tokens 负责理解和全局上下文；
+pair field 负责 pointer decoding、contact localization 和解释；
+resampler attention map 负责把 compact token 映射回具体 site-pair。
+```
+
+### 9.3 Pose / Refinement
+
+Pose 任务需要 anchor pair 和局部几何。可以设置一部分 pose-oriented queries：
+
+```text
+pose_anchor_queries
+```
+
+它们 cross-attend 到 pair field 后，为 decoder 生成：
+
+```text
+<ANCHOR P_i L_j>
+<TRANS_BIN_*>
+<ROT_BIN_*>
+<TORSION_BIN_*>
+```
+
+同时保留 pair-level anchor auxiliary loss。
+
+---
+
+## 10. 三个任务的建议输出格式
 
 以下输出格式是第一版最小闭环。后续可以扩展，但不要一开始使用完整 program language。
 
-### 6.1 Affinity / property understanding
+### 10.1 Affinity / property understanding
 
 任务 token：
 
@@ -244,7 +707,7 @@ L_aff = CE(affinity_bin) + MSE(affinity_residual)
 
 可以保留 direct scalar regression head 作为训练辅助，但主接口仍然是生成 affinity tokens。
 
-### 6.2 Binding site / contact understanding
+### 10.2 Binding site / contact understanding
 
 任务 token：
 
@@ -279,7 +742,7 @@ L_site_gen = pointer CE for generated site/contact tokens
 
 这些可以后续作为 explanation extension。
 
-### 6.3 Pose / local refinement generation
+### 10.3 Pose / local refinement generation
 
 任务 token：
 
@@ -324,7 +787,7 @@ complex reranking
 
 ---
 
-## 7. 训练阶段
+## 11. 训练阶段
 
 ### Stage 0：数据和标签审计
 
@@ -416,7 +879,7 @@ teacher-forced vs generated consistency loss
 
 ---
 
-## 8. Teacher forcing 的使用要求
+## 12. Teacher forcing 的使用要求
 
 Teacher forcing 的作用是：
 
@@ -448,9 +911,9 @@ teacher-forced 和 generated 都好
 
 ---
 
-## 9. Scheduled sampling 策略
+## 13. Scheduled sampling 策略
 
-### 9.1 总体策略
+### 13.1 总体策略
 
 采用：
 
@@ -486,7 +949,7 @@ entropy = -sum p log p
 
 loss 仍然对 gold token 计算，sampling 只影响下一步输入。
 
-### 9.2 不推荐的策略
+### 13.2 不推荐的策略
 
 不要使用：
 
@@ -504,7 +967,7 @@ confidence > tau 就 100% 用自己
 
 这会导致某个 epoch 置信度整体升高时 self-sampling 暴涨，训练不稳。
 
-### 9.3 两级门控
+### 13.3 两级门控
 
 推荐实现：
 
@@ -531,7 +994,7 @@ next_token = torch.where(use_self, pred_token.detach(), gold_token)
 loss_t = cross_entropy(logits_t, gold_token)
 ```
 
-### 9.4 Schedule
+### 13.4 Schedule
 
 推荐 schedule：
 
@@ -568,7 +1031,7 @@ epoch 20+:
     p_self = 0.40
 ```
 
-### 9.5 目标 self-rate 控制
+### 13.5 目标 self-rate 控制
 
 比固定 `p_self` 更稳的方式是控制目标 self-sampling 比例：
 
@@ -589,7 +1052,7 @@ target_self_rate:
 0% -> 10% -> 25% -> 40%
 ```
 
-### 9.6 任务级阈值建议
+### 13.6 任务级阈值建议
 
 不同任务应有不同阈值和 self-sampling 上限。
 
@@ -631,7 +1094,7 @@ EOS 必须单独更严格，避免过早结束。
 tau_eos >= 0.95
 ```
 
-### 9.7 Position-aware sampling
+### 13.7 Position-aware sampling
 
 可选加入位置因子：
 
@@ -650,7 +1113,7 @@ Pose 任务中，anchor token 前期尤其应保守。
 
 ---
 
-## 10. 推理时 decoding 策略
+## 14. 推理时 decoding 策略
 
 训练时 scheduled sampling 不等于推理时 sampling。
 
@@ -671,7 +1134,7 @@ POSE:
 
 ---
 
-## 11. 评估要求
+## 15. 评估要求
 
 必须同时报告：
 
@@ -730,7 +1193,7 @@ invalid token / invalid grammar rate
 
 ---
 
-## 12. Ablation 要求
+## 16. Ablation 要求
 
 第一版必须保留可诊断 ablation，不得只报告 full model。
 
@@ -747,7 +1210,35 @@ invalid token / invalid grammar rate
 8. generated vs teacher-forced evaluation
 ```
 
-在三任务闭环稳定之前，不允许把 strict trace bottleneck 作为唯一主结果。
+### 16.1 信息压缩 ablation
+
+新增必须比较：
+
+```text
+1. mean pooling
+2. CLS pooling
+3. continuous Perceiver / Q-Former resampler
+4. continuous resampler + distance / chemistry bias
+5. continuous resampler + pair contact auxiliary loss
+6. continuous resampler + sparse top-k candidate pruning
+7. continuous resampler + slot attention / diversity regularization
+8. optional VQ / discrete interaction code, only after continuous version stable
+```
+
+重点观察：
+
+```text
+Affinity RMSE / Pearson / Spearman
+Site AUPRC / MCC / precision@k
+Contact AUPRC
+Pose RMSD / anchor accuracy
+generated vs teacher-forced gap
+memory / speed
+top attended pairs 是否覆盖真实 contact / anchor pair
+不同 query / slot 是否 collapse
+```
+
+在三任务闭环稳定之前，不允许把 strict trace bottleneck 或 VQ code 作为唯一主结果。
 
 如果后续重新加入 trace bottleneck，必须比较：
 
@@ -771,11 +1262,17 @@ site/contact 好，但 affinity 无提升
 
 prediction std / true std ratio 低
 => affinity dynamic range 塌缩
+
+continuous resampler 好，VQ 差
+=> interaction codebook 量化过早或几何损失过大
+
+VQ code usage collapse
+=> codebook 设计、commitment loss、usage regularization 或训练时机有问题
 ```
 
 ---
 
-## 13. 禁止事项
+## 17. 禁止事项
 
 在第一版 TRACE-Lite / UniTrace-3T 未稳定前，不建议做以下事情：
 
@@ -787,11 +1284,14 @@ prediction std / true std ratio 低
 5. 不要用测试集调阈值、选 checkpoint 或做后处理校准。
 6. 不要把 pose 模块包装成 full blind docking，除非真正实现全局搜索或等变生成机制。
 7. 不要把 structure-aware pretrained feature 的 fallback 当作完整结构预训练输入。
+8. 不要在 continuous interaction representation 未稳定前，把 VQ / discrete code 作为主压缩路径。
+9. 不要把所有 pair interaction 简单平均后送入 decoder。
+10. 不要在早期使用 hard top-k 排除大量 pair evidence。
 ```
 
 ---
 
-## 14. 成功门槛
+## 18. 成功门槛
 
 第一阶段成功不要求马上超过所有成熟 SOTA。更现实的门槛是：
 
@@ -802,31 +1302,39 @@ prediction std / true std ratio 低
 4. scheduled sampling 后 generated performance 改善，而 teacher-forced performance 不显著崩塌。
 5. site/contact/pose 至少有一个过程任务能稳定提供对 affinity 有帮助的信号。
 6. affinity prediction dynamic range 不明显塌缩。
+7. continuous resampler 的 attention 能覆盖真实 contact / anchor pair。
+8. sparse / slot 版本相比 continuous base 有解释性提升，且不显著损害主指标。
+9. VQ / discrete code 只有在 continuous base 稳定后才作为成功候选；成功时必须证明 codebook 有意义、使用不 collapse、且对生成/解释有增益。
 ```
 
 如果 full explainable trace 后续加入，但没有超过 direct / soft-coupled baseline，应报告为 failure analysis，不得宣称 strict trace 路径成功。
 
 ---
 
-## 15. 下一阶段实现优先级
+## 19. 下一阶段实现优先级
 
 建议顺序：
 
 ```text
 1. 实现 TRACE-Lite 数据格式和三任务 output schema。
-2. 实现 Structure-to-Token Adapter + Interaction Resampler。
-3. 实现 unified decoder-only / prefix-LM 主干。
-4. 先跑 teacher-forced 三任务生成。
-5. 加 direct auxiliary heads 稳定表示。
-6. 加 confidence-gated probabilistic scheduled sampling。
-7. 报告 generated vs teacher-forced gap。
-8. 再逐步加入 event auxiliary。
-9. 最后才考虑 soft trace coupling / strict trace bottleneck。
+2. 实现 Hybrid Interface-Aware 3D Tokenizer。
+3. 实现 Pair Interaction Mixer。
+4. 实现 continuous Perceiver / Q-Former Interaction Resampler。
+5. 实现 unified decoder-only / prefix-LM 主干。
+6. 先跑 teacher-forced 三任务生成。
+7. 加 direct auxiliary heads 稳定表示。
+8. 加 confidence-gated probabilistic scheduled sampling。
+9. 报告 generated vs teacher-forced gap。
+10. 加 pair contact / site / resampler attention coverage auxiliary loss。
+11. 再逐步加入 sparse top-k 或 slot attention 做解释性增强。
+12. 等 continuous interaction tokens 稳定后，做 offline clustering / prototype analysis。
+13. 只有 clustering / prototype 有意义时，再考虑 VQ / FSQ / discrete interaction code。
+14. 最后才考虑 soft trace coupling / strict trace bottleneck。
 ```
 
 ---
 
-## 16. 最终定位
+## 20. 最终定位
 
 TRACE 下一版应从：
 
@@ -838,6 +1346,20 @@ trace-centered mechanistic program model
 
 ```text
 task-token conditioned structure generation model
+```
+
+其底层表示路线应从：
+
+```text
+full symbolic trace program first
+```
+
+调整为：
+
+```text
+continuous interaction representation first
+-> sparse / slot grounding second
+-> discrete interaction language third
 ```
 
 先完成统一三任务生成模型的最小闭环，再逐步恢复可解释 trace 作为增强模块。这样更符合当前目标，也更接近可训练、可评估、可迭代的研究路径。
